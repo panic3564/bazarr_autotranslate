@@ -96,10 +96,10 @@ class Subtitle:
         name = from_str(obj.get("name"))
         code2 = from_str(obj.get("code2"))
         code3 = from_str(obj.get("code3"))
-        path = from_str(obj.get("path"))
+        path = from_union([from_str, from_none], obj.get("path"))
         forced = from_bool(obj.get("forced"))
         hi = from_bool(obj.get("hi"))
-        file_size = from_int(obj.get("file_size"))
+        file_size = from_union([from_int, from_none], obj.get("file_size"))
         return Subtitle(name, code2, code3, path, forced, hi, file_size)
 
     def to_dict(self) -> dict:
