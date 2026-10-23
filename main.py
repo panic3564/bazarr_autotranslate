@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import httpx
 import queue
 import signal
@@ -12,9 +13,11 @@ from unique_queue import UniqueQueue
 from logging.handlers import TimedRotatingFileHandler
 from class_types import Serie, Movie, SubtitleTranslate
 
+
 def get_env_or_default(env, default):
     val = os.getenv(env)
     return val if val is not None else default
+
 
 def get_attr_or_key(obj, name):
     if hasattr(obj, name):
@@ -23,6 +26,7 @@ def get_attr_or_key(obj, name):
         return obj[name]
     else:
         raise AttributeError(f"Missing attribute or key '{name}'")
+
 
 # Get configuration and setup things
 load_dotenv()
@@ -41,15 +45,45 @@ else:
 translation_request_timeout = int(get_env_or_default("TRANSLATION_REQUEST_TIMEOUT", 15 * 60))
 num_workers = int(get_env_or_default("NUM_WORKERS", 1))
 interval_between_scans = int(get_env_or_default("INTERVAL_BETWEEN_SCANS", 5 * 60))
+# Minimum age (in seconds) a source subtitle file must have before it is queued for translation.
+# Default: 24 hours. Gives Bazarr time to find and download a proper subtitle from providers first.
+min_subtitle_age = int(get_env_or_default("MIN_SUBTITLE_AGE_SECONDS", 24 * 60 * 60))
 log_level = get_env_or_default("LOG_LEVEL", "INFO")
 log_directory = get_env_or_default("LOG_DIRECTORY", "logs/")
 series_scan = bool(get_env_or_default("SERIES_SCAN", True))
 movies_scan = bool(get_env_or_default("MOVIES_SCAN", True))
 
-key_fn = lambda x: f" {"s" if get_attr_or_key(x, "is_serie") else "m"} {get_attr_or_key(x, "video_id")}_{get_attr_or_key(x, "to_language")}"
+key_fn = lambda x: f" {'s' if get_attr_or_key(x, 'is_serie') else 'm'} {get_attr_or_key(x, 'video_id')}_{get_attr_or_key(x, 'to_language')}"
 task_queue = UniqueQueue(key_fn=key_fn)
 shutdown_event = asyncio.Event()
 logger = logging.getLogger("bazarr_lingarr")
+
+
+def is_subtitle_old_enough(path: str) -> bool:
+    """
+    Return True only if the subtitle file at `path` is at least
+    `min_subtitle_age` seconds old, based on its modification time.
+    The modification time corresponds to the moment Bazarr wrote the
+    file to disk, so this effectively delays translation until Bazarr
+    has had `min_subtitle_age` seconds to satisfy the language through
+    its providers.
+
+    If the file cannot be inspected (not mounted, permission issue),
+    the subtitle is skipped and a warning is logged, so that a path
+    mapping problem never silently disables the age gate.
+    """
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        logger.warning(f"Skipping translation, unable to determine age of subtitle file: {path}. "
+                       f"Verify that the media path is mounted in this container at the same path Bazarr reports.")
+        return False
+    if age < min_subtitle_age:
+        logger.debug(f"Skipping translation, subtitle is only {int(age // 3600)} hours old "
+                     f"(minimum age: {int(min_subtitle_age // 3600)} hours): {path}")
+        return False
+    return True
+
 
 async def get_episodes_metadata(
     base_url: str,
@@ -82,7 +116,7 @@ async def get_episodes_metadata(
             response = await client.get(endpoint, headers=headers, params=params)
             response.raise_for_status()
             json = response.json()["data"]
-            
+
             logger.debug(f"received: {json}")
             return [Serie.from_dict(obj) for obj in json]
     except Exception as e:
@@ -101,7 +135,7 @@ async def get_wanted_episodes(
         base_url (str): Base URL of Bazarr API
         api_key (str): API key for authentication
         start (int): Paging start integer (default: 0)
-        length (int): Paging length integer (default: -1)
+        length (int): Paging length (default: -1)
         episode_ids (list[int], optional): List of specific episode IDs to check
     """
 
@@ -115,7 +149,7 @@ async def get_wanted_episodes(
             response = await client.get(endpoint, headers=headers, params=params)
             response.raise_for_status()
             json = response.json()["data"]
-            
+
             logger.debug(f"received: {json}")
             return [Serie.from_dict(obj) for obj in json]
     except Exception as e:
@@ -132,7 +166,7 @@ async def get_movies_metadata(
     Args:
         base_url (str): Base URL of Bazarr API
         api_key (str): API key for authentication
-        movie_ids (list[int], optional): List of movie IDs to get metadata for
+        movie_ids (list[int], optional): List of movies IDs to get metadata for
     """
 
     logger.debug(f"Getting metada for moveis: {movie_ids}")
@@ -148,7 +182,7 @@ async def get_movies_metadata(
             response = await client.get(endpoint, headers=headers, params=params)
             response.raise_for_status()
             json = response.json()["data"]
-            
+
             logger.debug(f"received: {json}")
             return [Movie.from_dict(obj) for obj in json]
     except Exception as e:
@@ -167,7 +201,7 @@ async def get_wanted_movies(
         base_url (str): Base URL of Bazarr API
         api_key (str): API key for authentication
         start (int): Paging start integer (default: 0)
-        length (int): Paging length integer (default: -1)
+        length (int): Paging length (default: -1)
     """
 
     logger.debug(f"Getting wanted movies")
@@ -180,7 +214,7 @@ async def get_wanted_movies(
             response = await client.get(endpoint, headers=headers, params=params)
             response.raise_for_status()
             json = response.json()["data"]
-            
+
             logger.debug(f"received: {json}")
             return [Movie.from_dict(obj) for obj in json]
     except Exception as e:
@@ -242,7 +276,8 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
                 # I don't think this should happen but better safe than sorry
 
             # If the subtitle is in the base language list, associate it with the language to translate in
-            if sub.code2 in base_languages:
+            # Only external subtitle files (with a path) that satisfy the minimum age are considered
+            if sub.code2 in base_languages and sub.path and is_subtitle_old_enough(sub.path):
                 subtitles_to_translate.append(SubtitleTranslate(sub, language, video_id, isinstance(video, Serie)))
                 found = True
                 break
@@ -264,6 +299,7 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]):
         logger.info(f"Queued: {sub.base_subtitle.path} to be translated to in: {sub.to_language}")
 
 def translation_worker(worker_id, base_url, api_key):
+
     endpoint = f"{base_url}/api/subtitles"
     headers = {"X-API-KEY": api_key}
     with httpx.Client(timeout=translation_request_timeout) as client:
@@ -345,7 +381,6 @@ def handle_shutdown():
     sys.exit(1)
 
 
-
 if __name__ == "__main__":
     # Do verification on arguments
     base_url = os.getenv("BAZARR_BASE_URL")
@@ -391,6 +426,10 @@ if __name__ == "__main__":
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    # Also log to stdout so `docker logs` shows the activity
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
     match log_level.lower():
         case "info":
@@ -404,6 +443,7 @@ if __name__ == "__main__":
             logger.debug(f"translation_request_timeout: {translation_request_timeout}")
             logger.debug(f"num_workers: {num_workers}")
             logger.debug(f"interval_between_scans: {interval_between_scans}")
+            logger.debug(f"min_subtitle_age: {min_subtitle_age}")
             logger.debug(f"log_level: {log_level}")
             logger.debug(f"log_directory: {log_directory}")
             logger.debug(f"series_scan: {series_scan}")
