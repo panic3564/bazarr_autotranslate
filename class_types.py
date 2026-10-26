@@ -2,41 +2,59 @@ from typing import Any, List, TypeVar, Callable, Type, cast, Optional
 
 T = TypeVar("T")
 
+
 def from_str(x: Any) -> str:
     assert isinstance(x, str)
     return x
+
 
 def from_bool(x: Any) -> bool:
     assert isinstance(x, bool)
     return x
 
+
 def from_list(f: Callable[[Any], T], x: Any) -> List[T]:
     assert isinstance(x, list)
     return [f(y) for y in x]
+
 
 def from_int(x: Any) -> int:
     assert isinstance(x, int) and not isinstance(x, bool)
     return x
 
+
 def from_none(x: Any) -> Any:
     assert x is None
     return x
 
+
 def from_union(fs, x):
+    """
+    Try each parser in turn and return the first successful result.
+
+    The previous implementation used a bare `except:` (which also swallows
+    KeyboardInterrupt and SystemExit) and ended in `assert False`, which made
+    every failure an uninformative AssertionError. This version raises a
+    ValueError that names the offending value and each parser failure.
+    """
+    errors = []
     for f in fs:
         try:
             return f(x)
-        except:
-            pass
-    assert False
+        except Exception as e:
+            errors.append(f"{getattr(f, '__name__', repr(f))}: {e}")
+    raise ValueError(f"Could not parse value {x!r} with any parser: {'; '.join(errors)}")
+
 
 def to_class(c: Type[T], x: Any) -> dict:
     assert isinstance(x, c)
     return cast(Any, x).to_dict()
 
+
 def is_type(t: Type[T], x: Any) -> T:
     assert isinstance(x, t)
     return x
+
 
 class MissingSubtitle:
     name: str
@@ -76,12 +94,12 @@ class Subtitle:
     name: str
     code2: str
     code3: str
-    path: str
+    path: Optional[str]
     forced: bool
     hi: bool
-    file_size: int
+    file_size: Optional[int]
 
-    def __init__(self, name: str, code2: str, code3: str, path: str, forced: bool, hi: bool, file_size: int) -> None:
+    def __init__(self, name: str, code2: str, code3: str, path: Optional[str], forced: bool, hi: bool, file_size: Optional[int]) -> None:
         self.name = name
         self.code2 = code2
         self.code3 = code3
@@ -96,6 +114,7 @@ class Subtitle:
         name = from_str(obj.get("name"))
         code2 = from_str(obj.get("code2"))
         code3 = from_str(obj.get("code3"))
+        # Embedded subtitles have no path and no file size
         path = from_union([from_str, from_none], obj.get("path"))
         forced = from_bool(obj.get("forced"))
         hi = from_bool(obj.get("hi"))
@@ -107,10 +126,11 @@ class Subtitle:
         result["name"] = from_str(self.name)
         result["code2"] = from_str(self.code2)
         result["code3"] = from_str(self.code3)
-        result["path"] = from_str(self.path)
+        # path and file_size may be None, so to_dict must not assert on them
+        result["path"] = from_union([from_str, from_none], self.path)
         result["forced"] = from_bool(self.forced)
         result["hi"] = from_bool(self.hi)
-        result["file_size"] = from_int(self.file_size)
+        result["file_size"] = from_union([from_int, from_none], self.file_size)
         return result
 
 
@@ -126,9 +146,10 @@ class Serie:
     episode_number: Optional[str]
     episode_title: Optional[str]
 
-    def __init__(self, missing_subtitles: List[MissingSubtitle], monitored: Optional[bool], sonarr_episode_id: int, sonarr_series_id: int, subtitles: Optional[List[Subtitle]], title: Optional[str], series_title: Optional[str], episode_number: Optional[str], episode_title: Optional[str]) -> None:
+    def __init__(self, missing_subtitles: List[MissingSubtitle], monitored: Optional[bool], path: Optional[str], sonarr_episode_id: int, sonarr_series_id: int, subtitles: Optional[List[Subtitle]], title: Optional[str], series_title: Optional[str], episode_number: Optional[str], episode_title: Optional[str]) -> None:
         self.missing_subtitles = missing_subtitles
         self.monitored = monitored
+        self.path = path
         self.sonarr_episode_id = sonarr_episode_id
         self.sonarr_series_id = sonarr_series_id
         self.subtitles = subtitles
@@ -142,14 +163,17 @@ class Serie:
         assert isinstance(obj, dict)
         missing_subtitles = from_list(MissingSubtitle.from_dict, obj.get("missing_subtitles"))
         monitored = from_union([from_bool, from_none], obj.get("monitored"))
+        # Present on /api/episodes, absent on /api/episodes/wanted
+        path = from_union([from_str, from_none], obj.get("path"))
         sonarr_episode_id = from_int(obj.get("sonarrEpisodeId"))
         sonarr_series_id = from_int(obj.get("sonarrSeriesId"))
         subtitles = from_union([lambda x: from_list(Subtitle.from_dict, x), from_none], obj.get("subtitles"))
         title = from_union([from_str, from_none], obj.get("title"))
         series_title = from_union([from_str, from_none], obj.get("seriesTitle"))
+        # 'episode_number' is a string like "3x15" on /api/episodes/wanted
         episode_number = from_union([from_str, from_none], obj.get("episode_number"))
         episode_title = from_union([from_str, from_none], obj.get("episodeTitle"))
-        return Serie(missing_subtitles, monitored, sonarr_episode_id, sonarr_series_id, subtitles, title, series_title, episode_number, episode_title)
+        return Serie(missing_subtitles, monitored, path, sonarr_episode_id, sonarr_series_id, subtitles, title, series_title, episode_number, episode_title)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -179,6 +203,7 @@ def serie_from_dict(s: Any) -> List[Serie]:
 
 def serie_to_dict(x: List[Serie]) -> Any:
     return from_list(lambda x: to_class(Serie, x), x)
+
 
 class Movie:
     title: str
@@ -227,6 +252,7 @@ def movie_from_dict(s: Any) -> List[Movie]:
 
 def movie_to_dict(x: List[Movie]) -> Any:
     return from_list(lambda x: to_class(Movie, x), x)
+
 
 class SubtitleTranslate:
     base_subtitle: Subtitle
