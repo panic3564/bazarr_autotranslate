@@ -132,7 +132,7 @@ If set up correctly, in Bazarr's history, translations should have the "Upgradab
 ```yml
 services:
     bazarr-autotranslate:
-        image: ghcr.io/zelak312/bazarr_autotranslate:latest
+        image: ghcr.io/panic3564/bazarr_autotranslate:latest
         environment:
             - BAZARR_BASE_URL=<bazarr_url>
             - BAZARR_API_KEY=<bazarr_api_key>
