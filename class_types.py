@@ -257,12 +257,21 @@ def movie_to_dict(x: List[Movie]) -> Any:
 class SubtitleTranslate:
     base_subtitle: Subtitle
     to_language: str
+    # Flags of the TARGET translation, taken from the missing-subtitles
+    # entry. Bazarr's translate API uses these values to name and register
+    # the resulting subtitle file (e.g. "movie.nl.forced.srt"), so they
+    # must describe the wanted variant, not the source subtitle.
+    to_forced: bool
+    to_hi: bool
     video_id: int
     is_serie: bool
 
-    def __init__(self, base_subtitle: Subtitle, to_language: str, video_id: int, is_serie: bool) -> None:
+    def __init__(self, base_subtitle: Subtitle, to_language: str, to_forced: bool, to_hi: bool,
+                 video_id: int, is_serie: bool) -> None:
         self.base_subtitle = base_subtitle
         self.to_language = to_language
+        self.to_forced = to_forced
+        self.to_hi = to_hi
         self.video_id = video_id
         self.is_serie = is_serie
 
@@ -270,6 +279,8 @@ class SubtitleTranslate:
         return {
             "base_subtitle": self.base_subtitle.to_dict(),
             "to_language": self.to_language,
+            "to_forced": self.to_forced,
+            "to_hi": self.to_hi,
             "video_id": self.video_id,
             "is_serie": self.is_serie
         }
