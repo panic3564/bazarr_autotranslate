@@ -162,9 +162,3 @@ services:
 ## Contributing
 
 Feel free to open issues or submit pull requests to improve this tool!
-
----
-
-## License
-
-MIT License
