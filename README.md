@@ -1,4 +1,3 @@
-successfully downloaded text file (SHA: 273340d76d597c905d0bdafff58f832fdfb469b8)
 # Bazarr Subtitle Translation Automation Script
 
 A Python script that automates subtitle translation in Bazarr by leveraging its API. The script identifies missing subtitles for movies and series, checks if existing subtitles can be translated into the missing language, and queues translation requests automatically.
