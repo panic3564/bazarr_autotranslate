@@ -9,7 +9,7 @@ import threading
 from typing import List, Optional
 from dotenv import load_dotenv
 from unique_queue import UniqueQueue
-from class_types import Serie, Movie, SubtitleTranslate
+from class_types import Serie, Movie, SubtitleTranslate, MissingSubtitle
 from logging.handlers import TimedRotatingFileHandler
 
 
@@ -58,9 +58,17 @@ def parse_int(env_name, default):
         sys.exit(1)
 
 
-def task_key(is_serie: bool, video_id: int, to_language: str) -> str:
-    """Unique key for one video-to-language translation request."""
-    return f" {'s' if is_serie else 'm'} {video_id}_{to_language}"
+def task_key(is_serie: bool, video_id: int, to_language: str, to_forced: bool, to_hi: bool) -> str:
+    """
+    Unique key for one video-to-language translation request.
+
+    The forced and hearing-impaired flags are part of the key: a single
+    video can be missing the regular, the forced and the hearing-impaired
+    variant of the same language at the same time, and each of those is a
+    separate translation request.
+    """
+    flags = f"{'f' if to_forced else '-'}{'h' if to_hi else '-'}"
+    return f"{'s' if is_serie else 'm'}_{video_id}_{to_language}_{flags}"
 
 
 # Get configuration and setup things
@@ -85,16 +93,34 @@ min_subtitle_age = parse_int("MIN_SUBTITLE_AGE_SECONDS", 24 * 60 * 60)
 #   per scan, to protect a paid translation service from large bursts.
 max_retries = parse_int("MAX_RETRIES", 3)
 max_translations_per_scan = parse_int("MAX_TRANSLATIONS_PER_SCAN", 0)
+# Minimum number of seconds to wait between two translation requests sent
+# by this container. 0 disables the delay. This is a simple rate limiter
+# that protects a (paid) translation service from bursts when a scan
+# discovers a large backlog in one go.
+translation_delay = parse_int("TRANSLATION_DELAY_SECONDS", 0)
+# When true, the script only logs which translations it would request and
+# never sends anything to Bazarr. Useful to validate a new configuration
+# (language lists, path mapping, age gate) before real translations start.
+dry_run = parse_bool(os.getenv("DRY_RUN"), "DRY_RUN", False)
 
 log_level = get_env_or_default("LOG_LEVEL", "INFO")
 log_directory = get_env_or_default("LOG_DIRECTORY", "logs/")
+# How many rotated log files to keep.
+log_backup_count = parse_int("LOG_BACKUP_COUNT", 4)
 series_scan = parse_bool(os.getenv("SERIES_SCAN"), "SERIES_SCAN", True)
 movies_scan = parse_bool(os.getenv("MOVIES_SCAN"), "MOVIES_SCAN", True)
 
-key_fn = lambda x: task_key(get_attr_or_key(x, "is_serie"), get_attr_or_key(x, "video_id"), get_attr_or_key(x, "to_language"))
+key_fn = lambda x: task_key(get_attr_or_key(x, "is_serie"), get_attr_or_key(x, "video_id"),
+                            get_attr_or_key(x, "to_language"), get_attr_or_key(x, "to_forced"),
+                            get_attr_or_key(x, "to_hi"))
 
 task_queue = UniqueQueue(key_fn=key_fn)
 shutdown_event = asyncio.Event()
+# Set alongside shutdown_event when a termination signal arrives. Workers
+# wait on this event instead of time.sleep() when spacing translation
+# requests by TRANSLATION_DELAY_SECONDS, so setting it ends an in-progress
+# delay immediately instead of holding up the shutdown.
+shutdown_thread_event = threading.Event()
 # Failed translation attempts per task key, used to enforce MAX_RETRIES
 failure_counts: dict[str, int] = {}
 failure_lock = threading.Lock()
@@ -275,33 +301,37 @@ async def find_base_language_subtitles_from_missing_subtitles(
     api_key: str,
     videos: List[Serie] | List[Movie],
 ) -> Optional[List[SubtitleTranslate]]:
-    # Making a video id to languages map, useful later on.
-    # A video can be missing several target languages at once, so every
-    # missing language is collected instead of keeping only the last one.
-    video_id_languages_map: dict[int, List[str]] = {}
+    # Making a video id to missing-subtitles map, useful later on.
+    # The full MissingSubtitle entry is kept instead of only its code2:
+    # the same language can be missing more than once (as regular, forced
+    # and hearing-impaired variants), and each variant needs its own
+    # translation request with its own flags.
+    video_id_missing_map: dict[int, List[MissingSubtitle]] = {}
     for video in videos:
         # Get video id from the correct property depending on the video instance
         video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
         for missing_sub in video.missing_subtitles:
             # Check if the missing subtitle is in the list of languages to translate to
             if missing_sub.code2 in to_languages:
-                # Check if that subtitle is already in the translation list
-                if task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id, "to_language": missing_sub.code2}):
+                # Check if that subtitle is already in the translation queue
+                if task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id,
+                                     "to_language": missing_sub.code2, "to_forced": missing_sub.forced,
+                                     "to_hi": missing_sub.hi}):
                     logger.debug(f"Skipping subtitle, already in translation queue, {missing_sub.to_dict()}")
                     continue
 
-                video_id_languages_map.setdefault(video_id, []).append(missing_sub.code2)
+                video_id_missing_map.setdefault(video_id, []).append(missing_sub)
 
-    if len(video_id_languages_map) == 0:
+    if len(video_id_missing_map) == 0:
         logger.info("No missing subtitles found that are in the list of languages to be translated")
         return None
 
     if isinstance(videos[0], Serie):
         metadata = await get_episodes_metadata(
-            client, base_url, api_key, episode_ids=list(video_id_languages_map.keys())
+            client, base_url, api_key, episode_ids=list(video_id_missing_map.keys())
         )
     else:
-        metadata = await get_movies_metadata(client, base_url, api_key, movie_ids=list(video_id_languages_map.keys()))
+        metadata = await get_movies_metadata(client, base_url, api_key, movie_ids=list(video_id_missing_map.keys()))
 
     if metadata is None:
         logger.info("No metadata returned, couldn't find already existing subtitles")
@@ -315,7 +345,7 @@ async def find_base_language_subtitles_from_missing_subtitles(
     # Check the metadata for already existing subtitles
     # Match the existing subtitles from the base language list to the missing ones for translation
     subtitles_to_translate: List[SubtitleTranslate] = []
-    for video_id, languages in video_id_languages_map.items():
+    for video_id, missing_subs in video_id_missing_map.items():
         # Get the video associated
         video = video_id_to_video_map.get(video_id)
         if video is None:
@@ -327,23 +357,37 @@ async def find_base_language_subtitles_from_missing_subtitles(
             logger.debug(f"Skipping video: {video_id}, no currently existing subtitles found")
             continue
 
-        for language in languages:
-            found = False
-            for sub in video.subtitles:
-                if language == sub.code2:
-                    # Skip metadata for a subtitle if it is already in the language to translate to
-                    # I don't think this should happen but better safe than sorry
-                    continue
+        for missing in missing_subs:
+            # Usable sources: external files (with a path) in a base language
+            # that satisfy the minimum age. Only external files qualify, and
+            # a subtitle that already has the target language is never used
+            # as a source (guards against overlapping base/target lists).
+            candidates = [sub for sub in video.subtitles
+                          if sub.code2 in base_languages
+                          and sub.code2 != missing.code2
+                          and sub.path
+                          and is_subtitle_old_enough(sub.path)]
 
-                # If the subtitle is in the base language list, associate it with the language to translate to.
-                # Only external subtitle files (with a path) that satisfy the minimum age are considered
-                if sub.code2 in base_languages and sub.path and is_subtitle_old_enough(sub.path):
-                    subtitles_to_translate.append(SubtitleTranslate(sub, language, video_id, isinstance(video, Serie)))
-                    found = True
-                    break
+            if not candidates:
+                logger.debug(f"No matching existing subtitle found for: {missing.code2} "
+                             f"(forced: {missing.forced}, hi: {missing.hi}) for video: {video_id}")
+                continue
 
-            if not found:
-                logger.debug(f"No matching existing subtitle found for: {language} for video: {video_id}")
+            # Prefer a source whose forced and hearing-impaired flags match
+            # the missing entry: a forced translation is best produced from
+            # a forced source and a hearing-impaired one from a
+            # hearing-impaired source. Fall back to the first candidate if
+            # no matching variant exists, which mirrors what Bazarr's manual
+            # translate dialog does.
+            matching = [sub for sub in candidates
+                        if sub.forced == missing.forced and sub.hi == missing.hi]
+            source = matching[0] if matching else candidates[0]
+
+            # The flags of the MISSING entry are carried along: Bazarr's
+            # translate API expects the flags of the target translation,
+            # not of the source file.
+            subtitles_to_translate.append(SubtitleTranslate(source, missing.code2, missing.forced,
+                                                            missing.hi, video_id, isinstance(video, Serie)))
 
     if len(subtitles_to_translate) == 0:
         logger.info("No already existing subtitles matched with requested translation subs")
@@ -364,7 +408,7 @@ async def find_base_language_subtitles_from_missing_subtitles(
 def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
     queued = 0
     for sub in subtitles:
-        key = task_key(sub.is_serie, sub.video_id, sub.to_language)
+        key = task_key(sub.is_serie, sub.video_id, sub.to_language, sub.to_forced, sub.to_hi)
         # Skip items that have exceeded the retry limit, so a permanently
         # failing subtitle cannot hammer a (paid) translation service forever
         if max_retries > 0 and failure_counts.get(key, 0) >= max_retries:
@@ -374,9 +418,16 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
                 f"Restart the process to retry it again."
             )
             continue
+        variant = f"{'.forced' if sub.to_forced else ''}{'.hi' if sub.to_hi else ''}"
+        if dry_run:
+            # DRY_RUN: log the request without queueing it, so a new setup
+            # can be validated before real translations are triggered
+            logger.info(f"[DRY RUN] Would translate {sub.base_subtitle.path} to: {sub.to_language}{variant}")
+            queued += 1
+            continue
         task_queue.put(sub)
         queued += 1
-        logger.info(f"Queued: {sub.base_subtitle.path} to be translated to: {sub.to_language}")
+        logger.info(f"Queued: {sub.base_subtitle.path} to be translated to: {sub.to_language}{variant}")
     return queued
 
 
@@ -390,18 +441,22 @@ def translation_worker(worker_id, base_url, api_key):
                 # Shutdown sentinel put by main() during a graceful shutdown
                 logger.info(f"[Worker: {worker_id}] Shutting down")
                 return
-            key = task_key(sub.is_serie, sub.video_id, sub.to_language)
+            key = task_key(sub.is_serie, sub.video_id, sub.to_language, sub.to_forced, sub.to_hi)
             logger.info(f"[Worker: {worker_id}] Translating: {sub.base_subtitle.path} to: {sub.to_language}")
             try:
                 params = {
                     "action": "translate",
                     "language": sub.to_language,
+                    # Bazarr parses booleans by comparing the raw query string
+                    # to "True"/"False" (capitalized). httpx serializes Python
+                    # booleans as lowercase "true"/"false", which Bazarr would
+                    # always read as False, so explicit strings are required.
+                    "forced": "True" if sub.to_forced else "False",
+                    "hi": "True" if sub.to_hi else "False",
                     "path": sub.base_subtitle.path,
                     "type": "episode" if sub.is_serie else "movie",
                     "id": sub.video_id,
-                    "forced": sub.base_subtitle.forced,
-                    "hi": sub.base_subtitle.hi,
-                    "original_format": True,
+                    "original_format": "True",
                 }
 
                 response = client.patch(endpoint, headers=headers, params=params)
@@ -418,6 +473,11 @@ def translation_worker(worker_id, base_url, api_key):
                     failure_counts[key] = failure_counts.get(key, 0) + 1
             finally:
                 task_queue.done(sub)
+                if translation_delay > 0:
+                    # Rate limiting: space out requests to the translation
+                    # service. Waiting on the shutdown event lets a shutdown
+                    # signal interrupt the delay immediately.
+                    shutdown_thread_event.wait(translation_delay)
 
 
 async def scan_and_process_series(client, base_url, api_key):
@@ -478,6 +538,7 @@ async def main(base_url, api_key):
 
     # Wake all idle workers so they exit cleanly instead of being killed
     # mid-translation when the process exits
+    shutdown_thread_event.set()
     for _ in range(num_workers):
         task_queue.put(None)
     for t in worker_threads:
@@ -488,6 +549,8 @@ async def main(base_url, api_key):
 def handle_shutdown():
     logger.info("Received exit signal, shutting down after the current scan")
     shutdown_event.set()
+    # Wake any worker that is currently waiting out TRANSLATION_DELAY_SECONDS
+    shutdown_thread_event.set()
 
 
 if __name__ == "__main__":
@@ -534,7 +597,8 @@ if __name__ == "__main__":
     trailing_slash = "/" if not log_directory.endswith("/") else ""
     os.makedirs(log_directory, exist_ok=True)
     handler = TimedRotatingFileHandler(
-        f"{log_directory}{trailing_slash}bazarr_lingarr_autotranslate.log", when="midnight", interval=1, backupCount=4
+        f"{log_directory}{trailing_slash}bazarr_lingarr_autotranslate.log", when="midnight", interval=1,
+        backupCount=log_backup_count
     )
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
@@ -557,8 +621,11 @@ if __name__ == "__main__":
             logger.debug(f"min_subtitle_age: {min_subtitle_age}")
             logger.debug(f"max_retries: {max_retries}")
             logger.debug(f"max_translations_per_scan: {max_translations_per_scan}")
+            logger.debug(f"translation_delay: {translation_delay}")
+            logger.debug(f"dry_run: {dry_run}")
             logger.debug(f"log_level: {log_level}")
             logger.debug(f"log_directory: {log_directory}")
+            logger.debug(f"log_backup_count: {log_backup_count}")
             logger.debug(f"series_scan: {series_scan}")
             logger.debug(f"movies_scan: {movies_scan}")
             logger.debug("End Configuration: ----------------")
