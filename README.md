@@ -1,3 +1,4 @@
+successfully downloaded text file (SHA: 273340d76d597c905d0bdafff58f832fdfb469b8)
 # Bazarr Subtitle Translation Automation Script
 
 A Python script that automates subtitle translation in Bazarr by leveraging its API. The script identifies missing subtitles for movies and series, checks if existing subtitles can be translated into the missing language, and queues translation requests automatically.
@@ -124,18 +125,18 @@ Logs are saved to the directory specified by `LOG_DIRECTORY` with the log level 
 For Lingarr to do the translation, make sure to have Lingarr set up correctly in Bazarr's settings as shown below (those settings will change for you, but Lingarr has to be selected)  
 `Settings -> Subtitles -> Translating`
 
-Lingarr translation settings in bazarr
+![Lingarr translation settings in bazarr](assets/lingarr_settings.png)
 
 ## Translated Subtitle Upgrade
 
 If you want the translated subtitle to be upgraded if Bazarr finds a subtitle in that language, you MUST have the upgrade setting on, see below (those settings may change for you but `Upgrade Manually Downloaded or Translated Subtitles` must be enabled)  
 `Settings -> Subtitles -> Upgrading Subtitles`
 
-Setting for upgrading subtitles
+![Setting for upgrading subtitles](assets/upgrade_subs_settings.png)
 
 If set up correctly, in Bazarr's history, translations should have the "Upgradable" icon
 
-Upgradable shown in bazarr's history
+![Upgradable shown in bazarr's history](assets/bazarr_upgrade.png)
 
 ## Docker Compose Example
 
