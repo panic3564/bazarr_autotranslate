@@ -6,13 +6,42 @@ on:
             tag:
                 description: "Version Tag"
                 required: true
+    pull_request:
+        branches: [main]
 
 permissions: # Add the permissions field here
     contents: read
     packages: write
 
 jobs:
+    build-smoke:
+        # Build the image on pull requests without pushing it, so changes
+        # to the Dockerfile (including the base image digest pin) are
+        # validated by CI before they reach main
+        if: github.event_name == 'pull_request'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+
+            - name: Build the image
+              run: docker build -t bazarr_autotranslate:smoke .
+
+            - name: Check the base image digest against the tag
+              run: |
+                  pinned="$(grep -oP '(?<=@)sha256:[0-9a-f]{64}' Dockerfile)"
+                  current="$(docker buildx imagetools inspect python:3.12-alpine --format '{{json .Manifest.Digest}}' | tr -d '"')"
+                  echo "Pinned digest: $pinned"
+                  echo "Current tag digest: $current"
+                  if [ "$pinned" != "$current" ]; then
+                    echo "::warning::python:3.12-alpine has moved upstream: the Dockerfile pins $pinned but the tag now resolves to $current. Re-pin the digest when upgrading."
+                  fi
+
     build-and-push:
+        # Publishing stays manual: only a dispatched release build pushes
+        if: github.event_name == 'workflow_dispatch'
         runs-on: ubuntu-latest
         env:
             PLATFORMS: linux/amd64, linux/arm64
