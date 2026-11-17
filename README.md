@@ -144,6 +144,8 @@ If set up correctly, in Bazarr's history, translations should have the "Upgradab
 
 ## Docker Compose Example
 
+A new image is built and pushed to the GitHub Container Registry automatically whenever a release is published, and the `latest` tag always points at the newest stable release.
+
 ```yml
 services:
     bazarr-autotranslate:

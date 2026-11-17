@@ -8,6 +8,8 @@ on:
                 required: true
     pull_request:
         branches: [main]
+    release:
+        types: [published]
 
 permissions: # Add the permissions field here
     contents: read
@@ -40,8 +42,9 @@ jobs:
                   fi
 
     build-and-push:
-        # Publishing stays manual: only a dispatched release build pushes
-        if: github.event_name == 'workflow_dispatch'
+        # Publish on a manual dispatch and whenever a release is published;
+        # pull requests only run the build-smoke job above
+        if: github.event_name != 'pull_request'
         runs-on: ubuntu-latest
         env:
             PLATFORMS: linux/amd64, linux/arm64
@@ -49,7 +52,7 @@ jobs:
             - name: Checkout
               uses: actions/checkout@v7
               with:
-                  # The latest-tag detection compares the dispatched tag
+                  # The latest-tag detection compares the tag being built
                   # against the full tag list, which needs the tags on
                   # disk: the default shallow checkout fetches a single
                   # commit and no tags at all
@@ -69,9 +72,14 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Determine Tag Name
-              # Only workflow_dispatch can trigger this workflow, so the tag
-              # always comes from the dispatch input
-              run: echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+              # A manual dispatch provides the tag as an input; a published
+              # release provides it as the release's tag name
+              run: |
+                  if [ -n "${{ github.event.inputs.tag }}" ]; then
+                      echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+                  else
+                      echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+                  fi
 
             - name: Determine if latest tag
               run: |
