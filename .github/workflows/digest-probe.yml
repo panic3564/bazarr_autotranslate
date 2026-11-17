@@ -1,0 +1,23 @@
+name: Digest probe
+
+# Temporary scaffold: resolves the current multi-arch digest of the base
+# image from a GitHub runner (this environment cannot reach Docker Hub
+# directly) and reports it as job annotations. Removed by the follow-up
+# commit once the digest is pinned in the Dockerfile.
+on:
+    push:
+        branches: [chore/pin-base-image-digest]
+
+jobs:
+    probe:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - name: Resolve the python:3.12-alpine digest
+              run: |
+                  docker buildx imagetools inspect python:3.12-alpine | while IFS= read -r line; do
+                    echo "::notice::${line}"
+                  done
+                  digest="$(docker buildx imagetools inspect python:3.12-alpine --format '{{json .Manifest.Digest}}' | tr -d '"')"
+                  echo "::notice::BASE_IMAGE_DIGEST=${digest}"
