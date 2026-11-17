@@ -14,6 +14,9 @@ from unique_queue import UniqueQueue
 from class_types import Serie, Movie, SubtitleTranslate, MissingSubtitle
 from logging.handlers import TimedRotatingFileHandler
 
+# Version reported in the startup banner; keep in sync with the release tags
+__version__ = "0.4"
+
 
 def get_env_or_default(env, default):
     val = os.getenv(env)
@@ -849,7 +852,7 @@ if __name__ == "__main__":
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     # Also log to stdout so `docker logs` shows the activity
-    console_handler = logging.StreamHandler()
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
@@ -886,6 +889,14 @@ if __name__ == "__main__":
             # INFO would hide a requested DEBUG (or ERROR) configuration
             print(f"Unknown LOG_LEVEL: {log_level!r}, expected DEBUG, INFO, WARNING or ERROR")
             sys.exit(1)
+
+    # Startup banner: confirms in the container logs (and in the log file)
+    # that the configuration parsed and the logging setup works, before
+    # anything is started, and states which version is running
+    logger.info(
+        f"Starting bazarr_autotranslate {__version__} "
+        f"(dry run: {dry_run}, workers: {num_workers}, scan interval: {interval_between_scans}s)"
+    )
 
     # Start running things
     loop = asyncio.new_event_loop()
